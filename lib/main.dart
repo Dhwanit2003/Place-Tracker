@@ -72,6 +72,18 @@ final GoRouter _router = GoRouter(
 );
 
 
+Future<String> getDeviceId() async {
+  final SharedPreferences prefs = await SharedPreferences.getInstance();
+  String? deviceId = prefs.getString('device_id');
+
+  if (deviceId == null) {
+    deviceId = Uuid().v4(); // Generate a new UUID
+    await prefs.setString('device_id', deviceId); // Store it persistently
+  }
+
+  return deviceId;
+}
+
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
@@ -134,7 +146,7 @@ class AuthPage extends StatelessWidget {
                   Icon(Icons.location_on_rounded, color: Colors.white, size: 35),
                   SizedBox(width: 8),
                   Text(
-                    'Tracker App',
+                    'Place Tracker App',
                     style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
                   ),
                 ],
@@ -238,18 +250,6 @@ class _MapPageState extends State<MapPage> {
     super.dispose();
   }
 
-  Future<String> getDeviceId() async {
-    final SharedPreferences prefs = await SharedPreferences.getInstance();
-    String? deviceId = prefs.getString('device_id');
-
-    if (deviceId == null) {
-      deviceId = Uuid().v4(); // Generate a new UUID
-      await prefs.setString('device_id', deviceId); // Store it persistently
-    }
-
-    return deviceId;
-  }
-
 
   Future<void> _getCurrentLocation() async {
     bool serviceEnabled;
@@ -336,8 +336,6 @@ class _MapPageState extends State<MapPage> {
 
       if(friendList.isEmpty)
         return;
-
-      
 
       FirebaseFirestore.instance
           .collection('Devices')
@@ -441,14 +439,50 @@ class _MapPageState extends State<MapPage> {
     }
   }
 
-  void _toggleButton(String buttonLabel) {
-    setState(() {
-      if (pressedButtons.contains(buttonLabel)) {
-        pressedButtons.remove(buttonLabel);
-      } else {
-        pressedButtons.add(buttonLabel);
+  void _toggleButton(String label) async {
+    // Check if label is already pressed
+    if (pressedButtons.contains(label)) {
+      // If pressed, remove markers for that label
+      _markers.removeWhere((marker) => marker.infoWindow.title == "$label Marker");
+      pressedButtons.remove(label); // Remove label from pressed set
+    } else {
+      // Otherwise, add markers for that label
+      final docSnapshot = await FirebaseFirestore.instance.collection('Devices').doc(deviceId).get();
+
+      if (docSnapshot.exists) {
+        final data = docSnapshot.data();
+
+        if (data != null && data.containsKey('Markers')) {
+          final markersMap = data['Markers'];
+
+          if (markersMap.containsKey(label.toLowerCase())) {
+            for (var markerData in markersMap[label.toLowerCase()]) {
+              final LatLng markerPosition = LatLng(markerData['latitude'], markerData['longitude']);
+              final int iconCodePoint = markerData['iconData'];
+              final int colorValue = markerData['color'];
+
+              BitmapDescriptor markerIcon = await _getMarkerIconFromIconData(
+                IconData(iconCodePoint, fontFamily: 'MaterialIcons'),
+                Color(colorValue),
+              );
+
+              _markers.add(
+                Marker(
+                  markerId: MarkerId(markerPosition.toString()),
+                  position: markerPosition,
+                  icon: markerIcon,
+                  infoWindow: InfoWindow(title: "$label Marker"),
+                ),
+              );
+            }
+          }
+        }
       }
-    });
+
+      pressedButtons.add(label); // Add label to pressed set
+    }
+
+    setState(() {}); // Trigger UI update
   }
 
   void _sendRequestToUser(String senderName, String recipientId) async {
@@ -534,7 +568,9 @@ class _MapPageState extends State<MapPage> {
         .where('username', isLessThanOrEqualTo: query + '\uf8ff')
         .get();
       setState(() {
-       friendList = querySnapshot.docs.map((doc) => doc['username'].toString()).toList();
+        userList = querySnapshot.docs.map((doc) => doc['username'].toString())
+            .where((username) => username != widget.userName)
+            .toList();
       });
   }
 
@@ -546,44 +582,89 @@ class _MapPageState extends State<MapPage> {
     return pressedButtons.contains(buttonLabel) ? Colors.white : Colors.black;
   }
 
-  var friendList = [];
+  var userList = [];
   bool _isExpanded = false;
 
 
-  void _toggleButtons() {
+  void _toggleButtons() async {
     setState(() {
       _isExpanded = !_isExpanded;
-
-      if (_isExpanded) {
-        // When expanded, add the marker with the default icon
-        _markers.clear(); // Clear any old markers
-        _markers.add(
-          Marker(
-            markerId: const MarkerId('currentLocation'),
-            position: _initialPosition, // Use the initial position as the marker position
-            icon: BitmapDescriptor.defaultMarker, // Default marker icon
-          ),
-        );
-      } else {
-        // When collapsed, reset the markers to the previous state
-        _markers.clear(); // Clear markers when collapsing
-        _markers.add(
-          Marker(
-            markerId: const MarkerId('currentLocation'),
-            position: _initialPosition, // Reset to initial position
-            icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueBlue), // Change the icon if needed
-          ),
-        );
-      }
     });
+
+    if (_isExpanded) {
+      // Clear any old markers
+      _markers.clear();
+
+      _markers.add(
+        Marker(
+          markerId: const MarkerId('currentLocation'),
+          position: _initialPosition, // Use the initial position as the marker position
+          icon: BitmapDescriptor.defaultMarker, // Default marker icon
+        ),
+      );
+
+      // Retrieve markers from Firebase
+      await _loadMarkersFromFirebase();
+
+      setState(() {}); // Trigger UI update after markers are loaded
+    } else {
+      // When collapsed, clear the markers and add a default marker
+      setState(() {
+        _markers.clear();
+        _markers.add(
+          Marker(
+            markerId: const MarkerId('currentLocation'),
+            position: _initialPosition,
+            icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueBlue),
+          ),
+        );
+      });
+    }
   }
+
+  Future<void> _loadMarkersFromFirebase() async {
+    // Retrieve markers from Firebase
+    final docSnapshot = await FirebaseFirestore.instance.collection('Devices').doc(deviceId).get();
+
+    if (docSnapshot.exists) {
+      final data = docSnapshot.data();
+
+      if (data != null && data.containsKey('Markers')) {
+        final markersMap = data['Markers'];
+
+        // Loop through each category in the Markers map
+        for (var category in ['favorites', 'visited', 'want to go']) {
+          if (markersMap.containsKey(category)) {
+            for (var markerData in markersMap[category]) {
+              // Extract marker details
+              final LatLng markerPosition = LatLng(markerData['latitude'], markerData['longitude']);
+              final int iconCodePoint = markerData['iconData'];
+              final int colorValue = markerData['color'];
+              // Create icon with specified color
+              BitmapDescriptor markerIcon = await _getMarkerIconFromIconData(IconData(iconCodePoint, fontFamily: 'MaterialIcons'), Color(colorValue));
+
+              // Add marker to the map
+              _markers.add(
+                Marker(
+                  markerId: MarkerId(markerPosition.toString()),
+                  position: markerPosition,
+                  icon: markerIcon,
+                  infoWindow: InfoWindow(title: "$category Marker"),
+                ),
+              );
+            }
+          }
+        }
+      }
+    }
+    setState(() {}); // Trigger a UI update
+  }
+
 
   void _onCameraMove(CameraPosition position) {
     // Clear the markers for the current frame
 
     if(_isExpanded){
-    _markers.clear();
-
     // Add the default marker at the current camera position
     _markers.add(
       Marker(
@@ -598,10 +679,11 @@ class _MapPageState extends State<MapPage> {
 
 
     setState(() {});
+   }
   }
-    }
 
   void _addStoredMarkers() async {
+
     for (MarkerData markerData in _markerPositions) {
       // Fetch the custom icon for the stored marker based on its icon data
       BitmapDescriptor markerIcon = await _getMarkerIconFromIconData(markerData.iconData,markerData.color);
@@ -619,7 +701,6 @@ class _MapPageState extends State<MapPage> {
 
     setState(() {}); // Trigger UI update to display the markers
   }
-
 
 
   Future<BitmapDescriptor> _getMarkerIconFromIconData(IconData iconData,Color color) async{
@@ -660,6 +741,20 @@ class _MapPageState extends State<MapPage> {
 
     BitmapDescriptor markerIcon = await _getMarkerIconFromIconData(icon,color);
 
+    String category;
+    if(icon == Icons.favorite){
+      category = 'favorites';
+    }
+    else if(icon == Icons.flag){
+      category = 'visited';
+    }
+    else if(icon == Icons.golf_course){
+      category = 'want to go';
+    }
+    else{
+      return;
+    }
+
     _markerPositions.add(MarkerData(position: markerPosition, iconData: icon,color: color));
 
 
@@ -673,6 +768,20 @@ class _MapPageState extends State<MapPage> {
         ),
       );
     });
+
+    await FirebaseFirestore.instance.collection('Devices').doc(deviceId).set({
+      'Markers':{
+        category : FieldValue.arrayUnion([
+          {
+            'latitude': markerPosition.latitude,
+            'longitude': markerPosition.longitude,
+            'iconData': icon.codePoint,
+            'color': color.value,
+          }
+        ]),
+      }
+    }, SetOptions(merge: true));
+
   }
 
 
@@ -749,7 +858,7 @@ class _MapPageState extends State<MapPage> {
                         return [];
                       }
                       searchUser(controller.text);
-                      return friendList.map((searchName)=>ListTile(
+                      return userList.map((searchName)=>ListTile(
                         title: Text(searchName),
                         onTap: (){
                           _showAlertDialog(searchName, widget.userName);
@@ -1129,6 +1238,12 @@ class _DashboardPageState extends State<DashboardPage> {
   PageController _pageController = PageController();
   int _currentIndex = 0;
 
+  Map<String, List<MarkerData>> _markersByCategory = {
+    'Favorites': [],
+    'Visited': [],
+    'Want to go': []
+  };
+
   void _onPageChanged(int index) {
     setState(() {
       _currentIndex = index;
@@ -1136,9 +1251,40 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   @override
+  void initState() {
+    super.initState();
+    _fetchMarkersFromFirebase(); // Fetch marker data from Firebase when the page loads
+  }
+
   void dispose() {
     _pageController.dispose();
     super.dispose();
+  }
+
+  Future<void> _fetchMarkersFromFirebase() async {
+    String deviceId = await getDeviceId();
+    final docSnapshot = await FirebaseFirestore.instance.collection('Devices').doc(deviceId).get();
+
+    if (docSnapshot.exists) {
+      final data = docSnapshot.data();
+      if (data != null && data.containsKey('Markers')) {
+        final markersMap = data['Markers'];
+
+        // Populate _markersByCategory with Firebase data
+        for (var category in ['favorites', 'visited', 'want to go']) {
+          if (markersMap.containsKey(category.toLowerCase())) {
+            _markersByCategory[category] = (markersMap[category.toLowerCase()] as List)
+                .map((markerData) => MarkerData(
+              position: LatLng(markerData['latitude'], markerData['longitude']),
+              iconData: IconData(markerData['iconData'], fontFamily: 'MaterialIcons'),
+              color: Color(markerData['color']),
+            ))
+                .toList();
+          }
+        }
+      }
+    }
+    setState(() {}); // Update UI with fetched marker data
   }
 
   Future<bool> signOutFromGoogle() async {
@@ -1265,11 +1411,21 @@ class _DashboardPageState extends State<DashboardPage> {
             style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 10),
-          Text(
-            "This is the content for the $title section.",
-            style: const TextStyle(fontSize: 16),
-            textAlign: TextAlign.center,
-          ),
+          if (_markersByCategory[title]?.isNotEmpty ?? false)
+            Expanded(
+              child: ListView.builder(
+                itemCount: _markersByCategory[title]?.length ?? 0,
+                itemBuilder: (context, index) {
+                  final marker = _markersByCategory[title]![index];
+                  return ListTile(
+                    leading: Icon(marker.iconData, color: marker.color),
+                    title: Text("Marker at ${marker.position.latitude}, ${marker.position.longitude}"),
+                  );
+                },
+              ),
+            )
+          else
+            const Text("No markers in this category."),
         ],
       ),
     );
